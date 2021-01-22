@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jinzhu/gorm"
@@ -23,7 +24,7 @@ type (
 	ORM interface {
 		CreateSpec(ctx context.Context, db *gorm.DB, taskDAG TaskDAG, maxTaskTimeout models.Interval) (int32, error)
 		CreateRun(ctx context.Context, jobID int32, meta map[string]interface{}) (int64, error)
-		ProcessNextUnclaimedTaskRun(ctx context.Context, fn ProcessTaskRunFunc) (bool, error)
+		ProcessNextUnfinishedRun(ctx context.Context, fn ProcessRunFunc) (bool, error)
 		ListenForNewRuns() (postgres.Subscription, error)
 		AwaitRun(ctx context.Context, runID int64) error
 		RunFinished(runID int64) (bool, error)
@@ -112,7 +113,7 @@ func (o *orm) CreateSpec(ctx context.Context, tx *gorm.DB, taskDAG TaskDAG, maxT
 			DotID:          task.DotID(),
 			PipelineSpecID: spec.ID,
 			Type:           task.Type(),
-			JSON:           JSONSerializable{task},
+			JSON:           JSONSerializable{task, false},
 			Index:          task.OutputIndex(),
 			SuccessorID:    successorID,
 		}
@@ -164,23 +165,26 @@ func (o *orm) CreateRun(ctx context.Context, jobID int32, meta map[string]interf
 	return runID, errors.WithStack(err)
 }
 
-type ProcessTaskRunFunc func(ctx context.Context, txdb *gorm.DB, jobID int32, ptRun TaskRun, predecessors []TaskRun) Result
+// TODO: Remove generation of special "result" task
+// TODO: Remove the unique index on successor_id
+type ProcessRunFunc func(ctx context.Context, txdb *gorm.DB, pRun Run) []TaskRunResult
 
-// ProcessNextUnclaimedTaskRun chooses any arbitrary incomplete TaskRun from the DB
+// FIXME: DOX
+// ProcessNextUnfinishedRun chooses any arbitrary incomplete TaskRun from the DB
 // whose parent TaskRuns have already been processed.
-func (o *orm) ProcessNextUnclaimedTaskRun(ctx context.Context, fn ProcessTaskRunFunc) (anyRemaining bool, err error) {
+func (o *orm) ProcessNextUnfinishedRun(ctx context.Context, fn ProcessRunFunc) (anyRemaining bool, err error) {
 	// Passed in context cancels on (chStop || JobPipelineMaxTaskDuration)
 	utils.RetryWithBackoff(ctx, func() (retry bool) {
-		err = o.processNextUnclaimedTaskRun(ctx, fn)
+		err = o.processNextUnfinishedRun(ctx, fn)
 		// "Record not found" errors mean that we're done with all unclaimed
-		// task runs.
+		// job runs.
 		if postgres.IsRecordNotFound(err) {
 			anyRemaining = false
 			retry = false
 			err = nil
 		} else if err != nil {
 			retry = true
-			err = errors.Wrap(err, "Pipeline runner could not process task run")
+			err = errors.Wrap(err, "Pipeline runner could not process job run")
 			logger.Error(err)
 
 		} else {
@@ -192,139 +196,97 @@ func (o *orm) ProcessNextUnclaimedTaskRun(ctx context.Context, fn ProcessTaskRun
 	return anyRemaining, errors.WithStack(err)
 }
 
-func (o *orm) processNextUnclaimedTaskRun(ctx context.Context, fn ProcessTaskRunFunc) error {
+func (o *orm) processNextUnfinishedRun(ctx context.Context, fn ProcessRunFunc) error {
+	// FIXME: Rename this var
 	// Passed in context cancels on (chStop || JobPipelineMaxTaskDuration)
 	txContext, cancel := context.WithTimeout(context.Background(), o.config.DatabaseMaximumTxDuration())
 	defer cancel()
+	var pRun Run
 
 	err := postgres.GormTransaction(txContext, o.db, func(tx *gorm.DB) error {
-		var ptRun TaskRun
-		var predecessors []TaskRun
-
-		// NOTE: Manual loads below can probably be replaced with Joins in
-		// gormv2.
-		//
-		// Further optimisations (condensing into fewer queries) are
-		// probably possible if this turns out to be a hot path
-
-		// Find (and lock) the next unlocked, unfinished pipeline_task_run with no uncompleted predecessors
-		err := tx.Raw(`
-            SELECT * from pipeline_task_runs WHERE id IN (
-                SELECT pipeline_task_runs.id FROM pipeline_task_runs
-                    INNER JOIN pipeline_task_specs ON pipeline_task_runs.pipeline_task_spec_id = pipeline_task_specs.id
-                    LEFT JOIN pipeline_task_specs AS predecessor_specs ON predecessor_specs.successor_id = pipeline_task_specs.id
-                    LEFT JOIN pipeline_task_runs AS predecessor_unfinished_runs ON predecessor_specs.id = predecessor_unfinished_runs.pipeline_task_spec_id
-                          AND pipeline_task_runs.pipeline_run_id = predecessor_unfinished_runs.pipeline_run_id
-                WHERE pipeline_task_runs.finished_at IS NULL
-                GROUP BY (pipeline_task_runs.id)
-                HAVING (
-                    bool_and(predecessor_unfinished_runs.finished_at IS NOT NULL)
-                    OR
-                    count(predecessor_unfinished_runs.id) = 0
-                )
-            )
-            LIMIT 1
-            FOR UPDATE OF pipeline_task_runs SKIP LOCKED;
-        `).Scan(&ptRun).Error
+		err := tx.Set("gorm:query_option", "FOR UPDATE SKIP LOCKED").
+			Where("finished_at IS NULL").
+			Preload("PipelineTaskRuns.PipelineTaskSpec.PipelineSpec").
+			First(&pRun).Error
 		if err != nil {
+			// TODO: Don't forget to update all the wording e.g. s/task run/run/g
 			return errors.Wrap(err, "error finding next task run")
 		}
+		logger.Infow("Pipeline run started", "runID", pRun.ID)
 
-		// Load the TaskSpec
-		if err = tx.Where("id = ?", ptRun.PipelineTaskSpecID).First(&ptRun.PipelineTaskSpec).Error; err != nil {
-			return errors.Wrap(err, "error finding next task run's spec")
+		trrs := fn(ctx, tx, pRun)
+
+		if err = o.updateTaskRuns(tx, trrs); err != nil {
+			return errors.Wrap(err, "could not update task runs")
 		}
 
-		// Load the PipelineRun
-		if err = tx.Where("id = ?", ptRun.PipelineRunID).First(&ptRun.PipelineRun).Error; err != nil {
-			return errors.Wrap(err, "error finding next task run's pipeline.Run")
+		if err = o.updatePipelineRun(tx, &pRun, trrs); err != nil {
+			return errors.Wrap(err, "could not mark pipeline_run as finished")
 		}
 
-		// Find all the predecessor task runs
-		err = tx.
-			Preload("PipelineTaskSpec").
-			Raw(`
-                SELECT pipeline_task_runs.* FROM pipeline_task_runs
-                INNER JOIN pipeline_task_specs AS specs_right ON specs_right.id = pipeline_task_runs.pipeline_task_spec_id
-                LEFT JOIN pipeline_task_specs AS specs_left ON specs_left.id = specs_right.successor_id
-                LEFT JOIN pipeline_task_runs AS successors ON successors.pipeline_task_spec_id = specs_left.id
-                      AND successors.pipeline_run_id = pipeline_task_runs.pipeline_run_id
-                WHERE successors.id = ?
-                ORDER BY pipeline_task_runs.index ASC
-            `, ptRun.ID).
-			Find(&predecessors).Error
+		err = o.eventBroadcaster.NotifyInsideGormTx(tx, postgres.ChannelRunCompleted, fmt.Sprintf("%v", pRun.ID))
 		if err != nil {
-			return errors.Wrap(err, "error finding task run predecessors")
+			return errors.Wrap(err, "could not notify pipeline_run_completed")
 		}
 
-		// Get the job ID
-		var job struct{ ID int32 }
-		err = tx.Raw(`
-            SELECT jobs.id FROM pipeline_task_runs
-            INNER JOIN pipeline_task_specs ON pipeline_task_specs.id = pipeline_task_runs.pipeline_task_spec_id
-            INNER JOIN jobs ON jobs.pipeline_spec_id = pipeline_task_specs.pipeline_spec_id
-            WHERE pipeline_task_runs.id = ?
-    		LIMIT 1
-        `, ptRun.ID).Scan(&job).Error
-		// TODO: Needs test, what happens if it can't find the job?!
-		if err != nil {
-			return errors.Wrap(err, "error finding job ID")
+		elapsed := time.Since(pRun.CreatedAt)
+		promPipelineRunTotalTimeToCompletion.WithLabelValues(string(pRun.PipelineSpecID)).Set(float64(elapsed))
+
+		if pRun.HasErrors() {
+			promPipelineRunErrors.WithLabelValues(string(pRun.PipelineSpecID)).Inc()
 		}
 
-		// Call the callback
-		result := fn(ctx, tx, job.ID, ptRun, predecessors)
-
-		// Update the task run record with the output and error
-		var out interface{}
-		var errString null.String
-		if result.Value != nil {
-			out = &JSONSerializable{Val: result.Value}
-		}
-		if finalErrors, is := result.Error.(FinalErrors); is {
-			errString = null.StringFrom(finalErrors.Error())
-		} else if result.Error != nil {
-			logger.Errorw("Error in pipeline task", "error", result.Error)
-			errString = null.StringFrom(result.Error.Error())
-		}
-		err = tx.Exec(`UPDATE pipeline_task_runs SET output = ?, error = ?, finished_at = ? WHERE id = ?`, out, errString, time.Now(), ptRun.ID).Error
-		if err != nil {
-			return errors.Wrap(err, "could not mark pipeline_task_run as finished")
-		}
-
-		pipelineSpecIDStr := string(ptRun.PipelineTaskSpec.PipelineSpecID)
-		var status string
-		if result.Error != nil {
-			status = "error"
-		} else {
-			status = "completed"
-		}
-		promPipelineTasksTotalFinished.WithLabelValues(pipelineSpecIDStr, string(ptRun.PipelineTaskSpec.Type), status).Inc()
-
-		if ptRun.PipelineTaskSpec.IsFinalPipelineOutput() {
-			err = tx.Exec(`UPDATE pipeline_runs SET finished_at = ?, outputs = ?, errors = ? WHERE id = ?`, time.Now(), out, errString, ptRun.PipelineRunID).Error
-			if err != nil {
-				return errors.Wrap(err, "could not mark pipeline_run as finished")
-			}
-			// Emit a Postgres notification if this is the final `ResultTask`
-			err = o.eventBroadcaster.NotifyInsideGormTx(tx, postgres.ChannelRunCompleted, fmt.Sprintf("%v", ptRun.PipelineRunID))
-			if err != nil {
-				return errors.Wrap(err, "could not notify pipeline_run_completed")
-			}
-
-			elapsed := time.Since(ptRun.CreatedAt)
-			promPipelineRunTotalTimeToCompletion.WithLabelValues(pipelineSpecIDStr).Set(float64(elapsed))
-			if finalErrors, is := result.Error.(FinalErrors); (is && finalErrors.HasErrors()) || result.Error != nil {
-				promPipelineRunErrors.WithLabelValues(pipelineSpecIDStr).Inc()
-			}
-
-			logger.Infow("Pipeline run completed", "runID", ptRun.PipelineRunID)
-		}
 		return nil
 	})
 	if err != nil {
-		return errors.Wrap(err, "while processing task run")
+		return errors.Wrap(err, "while processing run")
 	}
+	logger.Infow("Pipeline run completed", "runID", pRun.ID)
 	return nil
+}
+
+// updateTaskRuns updates multiple task runs in one query
+func (o *orm) updateTaskRuns(db *gorm.DB, trrs []TaskRunResult) error {
+	sql := `
+UPDATE pipeline_task_runs AS ptr SET
+output = updates.output,
+error = updates.error,
+finished_at = updates.finished_at
+FROM (VALUES
+%s
+) AS updates(id, output, error, finished_at)
+WHERE ptr.id = updates.id
+`
+	// NOTE: gormv1 does not support bulk updates so we have to
+	// manually construct it ourselves
+	valueStrings := []string{}
+	valueArgs := []interface{}{}
+	for _, trr := range trrs {
+		valueStrings = append(valueStrings, "(?::bigint, ?::jsonb, ?::text, ?::timestamptz)")
+		valueArgs = append(valueArgs, trr.ID, trr.Result.OutputDB(), trr.Result.ErrorDB(), trr.FinishedAt)
+	}
+
+	/* #nosec G201 */
+	stmt := fmt.Sprintf(sql, strings.Join(valueStrings, ","))
+	return db.Exec(stmt, valueArgs...).Error
+}
+
+func (o *orm) updatePipelineRun(db *gorm.DB, run *Run, trrs []TaskRunResult) error {
+	var result Result
+	for _, trr := range trrs {
+		if trr.IsFinal {
+			// FIXME: This assumes there is only one final result and will
+			// have to change when the magical "__result__" type is removed
+			result = trr.Result
+		}
+	}
+
+	return db.Raw(`
+		UPDATE pipeline_runs SET finished_at = ?, outputs = ?, errors = ?
+		WHERE id = ?
+		RETURNING *
+		`, time.Now(), result.OutputDB(), result.ErrorDB(), run.ID).
+		Scan(run).Error
 }
 
 func (o *orm) ListenForNewRuns() (postgres.Subscription, error) {
@@ -445,6 +407,7 @@ func (o *orm) ResultsForRun(ctx context.Context, runID int64) ([]Result, error) 
 
 func (o *orm) RunFinished(runID int64) (bool, error) {
 	var done struct{ Done bool }
+	// FIXME: Since we denormalised this can be made more efficient
 	err := o.db.Raw(`
         SELECT finished_at IS NOT NULL AS done
         FROM pipeline_task_runs

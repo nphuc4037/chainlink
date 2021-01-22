@@ -144,7 +144,9 @@ func (t *HTTPTask) Run(ctx context.Context, taskRun TaskRun, inputs []Result) Re
 		"response", string(responseBytes),
 		"url", t.URL.String(),
 	)
-	return Result{Value: responseBytes}
+	// NOTE: We always stringify the response. If a binary response is required
+	// we should add an adapter flag
+	return Result{Value: string(responseBytes)}
 }
 
 func (t *HTTPTask) allowUnrestrictedNetworkAccess() bool {

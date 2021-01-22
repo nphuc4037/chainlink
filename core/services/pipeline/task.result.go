@@ -10,6 +10,8 @@ import (
 	"gopkg.in/guregu/null.v4"
 )
 
+// TODO: This is no longer necessary, we should get rid of it
+
 // ResultTask exists solely as a Postgres performance optimization.  It's added
 // automatically to the end of every pipeline, and it receives the outputs of all
 // tasks that have no successor tasks.  This allows the pipeline runner to detect

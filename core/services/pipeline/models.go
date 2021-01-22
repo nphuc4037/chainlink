@@ -23,6 +23,7 @@ type (
 		ID             int32            `json:"-" gorm:"primary_key"`
 		DotID          string           `json:"dotId"`
 		PipelineSpecID int32            `json:"-"`
+		PipelineSpec   Spec             `json:"-"`
 		Type           TaskType         `json:"-"`
 		JSON           JSONSerializable `json:"-" gorm:"type:jsonb"`
 		Index          int32            `json:"-"`
@@ -72,6 +73,15 @@ func (r *Run) SetID(value string) error {
 	}
 	r.ID = int64(ID)
 	return nil
+}
+
+func (r Run) HasErrors() bool {
+	return r.FinalErrors().HasErrors()
+}
+
+func (r Run) FinalErrors() (f FinalErrors) {
+	f, _ = r.Errors.Val.(FinalErrors)
+	return f
 }
 
 func (tr TaskRun) GetID() string {
