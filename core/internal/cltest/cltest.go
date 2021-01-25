@@ -1109,7 +1109,7 @@ func WaitForPipelineComplete(t testing.TB, nodeID int, jobID int32, jo job.ORM, 
 		prs, _, err := jo.PipelineRunsByJobID(jobID, 0, 1000)
 		assert.NoError(t, err)
 		for i := range prs {
-			if prs[i].Outputs != nil {
+			if !prs[i].Outputs.Null {
 				errs, err := prs[i].Errors.MarshalJSON()
 				assert.NoError(t, err)
 				if string(errs) != "[null]" {
