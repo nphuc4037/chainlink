@@ -321,7 +321,15 @@ func (r *runner) ExecuteRun(ctx context.Context, txdb *gorm.DB, run Run) (trrs [
 				updateMu.Unlock()
 
 				elapsed := finishedAt.Sub(start)
+
 				promPipelineTaskExecutionTime.WithLabelValues(string(m.taskRun.PipelineTaskSpec.PipelineSpecID), string(m.taskRun.PipelineTaskSpec.Type)).Set(float64(elapsed))
+				var status string
+				if result.Error != nil {
+					status = "error"
+				} else {
+					status = "completed"
+				}
+				promPipelineTasksTotalFinished.WithLabelValues(string(m.taskRun.PipelineTaskSpec.PipelineSpecID), string(m.taskRun.PipelineTaskSpec.Type), status).Inc()
 
 				if m.next == nil {
 					return
